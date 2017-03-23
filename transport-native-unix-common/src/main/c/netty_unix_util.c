@@ -93,9 +93,11 @@ int netty_unix_util_clock_gettime(clockid_t clockId, struct timespec* tp) {
 #ifdef NETTY_USE_MACH_INSTEAD_OF_CLOCK
   uint64_t timeNs;
   switch (clockId) {
+#ifdef CLOCK_MONOTONIC_COARSE
   case CLOCK_MONOTONIC_COARSE:
     timeNs = mach_approximate_time();
     break;
+#endif
   case CLOCK_MONOTONIC:
     timeNs = mach_absolute_time();
     break;

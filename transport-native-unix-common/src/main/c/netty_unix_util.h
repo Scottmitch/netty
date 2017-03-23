@@ -20,8 +20,10 @@
 #include <jni.h>
 #include <time.h>
 
-#if defined(__MACH__) && !defined(CLOCK_REALTIME)
+#ifdef __MACH__
 #define NETTY_USE_MACH_INSTEAD_OF_CLOCK
+
+#ifndef CLOCK_REALTIME
 
 typedef int clockid_t;
 
@@ -32,6 +34,8 @@ typedef int clockid_t;
 #ifndef CLOCK_MONOTONIC_COARSE
 #define CLOCK_MONOTONIC_COARSE 2
 #endif
+
+#endif /* CLOCK_REALTIME */
 
 #endif /* __MACH__ */
 
