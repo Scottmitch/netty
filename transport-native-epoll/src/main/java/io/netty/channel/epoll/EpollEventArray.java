@@ -38,7 +38,7 @@ import io.netty.util.internal.PlatformDependent;
 final class EpollEventArray {
     // Size of the epoll_event struct
     private static final int EPOLL_EVENT_SIZE = Native.sizeofEpollEvent();
-    // The offsiet of the data union in the epoll_event struct
+    // The offset of the data union in the epoll_event struct
     private static final int EPOLL_DATA_OFFSET = Native.offsetofEpollData();
 
     private long memoryAddress;
@@ -49,11 +49,7 @@ final class EpollEventArray {
             throw new IllegalArgumentException("length must be >= 1 but was " + length);
         }
         this.length = length;
-        memoryAddress = allocate(length);
-    }
-
-    private static long allocate(int length) {
-        return PlatformDependent.allocateMemory(length * EPOLL_EVENT_SIZE);
+        memoryAddress = PlatformDependent.allocateMemory(length * EPOLL_EVENT_SIZE);
     }
 
     /**
@@ -75,10 +71,15 @@ final class EpollEventArray {
      * Increase the storage of this {@link EpollEventArray}.
      */
     void increase() {
-        // double the size
-        length <<= 1;
-        free();
-        memoryAddress = allocate(length);
+        // Double the capacity while it is "sufficiently small", and otherwise increase by 50%.
+        int newLength = length <= 65536 ? length << 1 : length + length >> 1;
+        long newMemoryAddress = PlatformDependent.reallocateMemory(memoryAddress, newLength * EPOLL_EVENT_SIZE);
+        if (newMemoryAddress == 0) {
+            throw new OutOfMemoryError("unable to allocate " + newLength + " new bytes! Existing capacity is: "
+                    + length);
+        }
+        memoryAddress = newMemoryAddress;
+        length = newLength;
     }
 
     /**
@@ -86,6 +87,7 @@ final class EpollEventArray {
      */
     void free() {
         PlatformDependent.freeMemory(memoryAddress);
+        memoryAddress = 0;
     }
 
     /**
