@@ -43,7 +43,7 @@ public abstract class AbstractMicrobenchmarkBase {
     protected static final int DEFAULT_WARMUP_ITERATIONS = 10;
     protected static final int DEFAULT_MEASURE_ITERATIONS = 10;
     protected static final String[] BASE_JVM_ARGS = {
-        "-server", "-dsa", "-da", "-ea:io.netty...", "-XX:+AggressiveOpts", "-XX:+UseBiasedLocking",
+        "-server", "-dsa", "-da", /*"-ea:io.netty...",*/ "-XX:+AggressiveOpts", "-XX:+UseBiasedLocking",
         "-XX:+UseFastAccessorMethods", "-XX:+OptimizeStringConcat",
         "-XX:+HeapDumpOnOutOfMemoryError", "-Dio.netty.leakDetection.level=disabled"};
 
