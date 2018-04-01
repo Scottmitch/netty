@@ -19,12 +19,12 @@ import io.netty.util.internal.DefaultPriorityQueue;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PriorityQueue;
 
-import static io.netty.util.concurrent.ScheduledFutureTask.deadlineNanos;
-
 import java.util.Comparator;
 import java.util.Queue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
+
+import static io.netty.util.concurrent.ScheduledFutureTask.deadlineNanos;
 
 /**
  * Abstract base class for {@link EventExecutor}s that want to support scheduling.
@@ -124,15 +124,21 @@ public abstract class AbstractScheduledEventExecutor extends AbstractEventExecut
      * You should use {@link #nanoTime()} to retrieve the correct {@code nanoTime}.
      */
     protected final Runnable pollScheduledTask(long nanoTime) {
+        Queue<ScheduledFutureTask<?>> scheduledTaskQueue = this.scheduledTaskQueue;
+        return scheduledTaskQueue != null ? pollScheduledTask(scheduledTaskQueue, nanoTime) : null;
+    }
+
+    final Runnable pollScheduledTask(Queue<ScheduledFutureTask<?>> scheduledTaskQueue, long nanoTime) {
+        assert scheduledTaskQueue != null;
         assert inEventLoop();
 
-        ScheduledFutureTask<?> scheduledTask = peekScheduledTask();
-        if (scheduledTask == null || scheduledTask.deadlineNanos() - nanoTime > 0) {
-            return null;
+        ScheduledFutureTask<?> scheduledTask = scheduledTaskQueue.peek();
+        if (scheduledTask != null && scheduledTask.deadlineNanos() <= nanoTime) {
+            scheduledTaskQueue.poll();
+            scheduledTask.setConsumed();
+            return scheduledTask;
         }
-        scheduledTaskQueue.remove();
-        scheduledTask.setConsumed();
-        return scheduledTask;
+        return null;
     }
 
     /**
@@ -242,30 +248,16 @@ public abstract class AbstractScheduledEventExecutor extends AbstractEventExecut
      * @deprecated will be removed in the future.
      */
     @Deprecated
-    protected void validateScheduled(long amount, TimeUnit unit) {
+    protected void validateScheduled(@SuppressWarnings("UnusedParameters") long amount,
+                                     @SuppressWarnings("UnusedParameters") TimeUnit unit) {
         // NOOP
-    }
-
-    final void scheduleFromEventLoop(final ScheduledFutureTask<?> task) {
-        // nextTaskId a long and so there is no chance it will overflow back to 0
-        scheduledTaskQueue().add(task.setId(++nextTaskId));
     }
 
     private <V> ScheduledFuture<V> schedule(final ScheduledFutureTask<V> task) {
         if (inEventLoop()) {
             scheduleFromEventLoop(task);
         } else {
-            final long deadlineNanos = task.deadlineNanos();
-            // task will add itself to scheduled task queue when run if not expired
-            if (beforeScheduledTaskSubmitted(deadlineNanos)) {
-                execute(task);
-            } else {
-                lazyExecute(task);
-                // Second hook after scheduling to facilitate race-avoidance
-                if (afterScheduledTaskSubmitted(deadlineNanos)) {
-                    execute(WAKEUP_TASK);
-                }
-            }
+            executeScheduledRunnable(task);
         }
 
         return task;
@@ -274,37 +266,45 @@ public abstract class AbstractScheduledEventExecutor extends AbstractEventExecut
     final void removeScheduled(final ScheduledFutureTask<?> task) {
         assert task.isCancelled();
         if (inEventLoop()) {
-            scheduledTaskQueue().removeTyped(task);
+            removedScheduleFromEventLoop(task);
         } else {
-            // task will remove itself from scheduled task queue when it runs
-            lazyExecute(task);
+            executeScheduledRunnable(task);
         }
     }
 
+    final void removedScheduleFromEventLoop(final ScheduledFutureTask<?> task) {
+        if (scheduledTaskQueue != null) {
+            scheduledTaskQueue.removeTyped(task);
+        }
+    }
+
+    final void scheduleFromEventLoop(final ScheduledFutureTask<?> task) {
+        // nextTaskId a long and so there is no chance it will overflow back to 0
+        scheduledTaskQueue().add(task.setId(++nextTaskId));
+    }
+
     /**
-     * Called from arbitrary non-{@link EventExecutor} threads prior to scheduled task submission.
-     * Returns {@code true} if the {@link EventExecutor} thread should be woken immediately to
-     * process the scheduled task (if not already awake).
-     * <p>
-     * If {@code false} is returned, {@link #afterScheduledTaskSubmitted(long)} will be called with
-     * the same value <i>after</i> the scheduled task is enqueued, providing another opportunity
-     * to wake the {@link EventExecutor} thread if required.
-     *
-     * @param deadlineNanos deadline of the to-be-scheduled task
-     *     relative to {@link AbstractScheduledEventExecutor#nanoTime()}
-     * @return {@code true} if the {@link EventExecutor} thread should be woken, {@code false} otherwise
+     * @deprecated No longer used. Controlled via {@link SingleThreadEventExecutor#wakesUpForTask(Runnable)}.
      */
-    protected boolean beforeScheduledTaskSubmitted(long deadlineNanos) {
+    @Deprecated
+    protected boolean beforeScheduledTaskSubmitted(@SuppressWarnings("UnusedParameters") long deadlineNanos) {
         return true;
     }
 
     /**
-     * See {@link #beforeScheduledTaskSubmitted(long)}. Called only after that method returns false.
-     *
-     * @param deadlineNanos relative to {@link AbstractScheduledEventExecutor#nanoTime()}
-     * @return  {@code true} if the {@link EventExecutor} thread should be woken, {@code false} otherwise
+     * @deprecated No longer used. Controlled via {@link SingleThreadEventExecutor#wakesUpForTask(Runnable)}.
      */
-    protected boolean afterScheduledTaskSubmitted(long deadlineNanos) {
-        return true;
+     @Deprecated
+     protected boolean afterScheduledTaskSubmitted(@SuppressWarnings("UnusedParameters") long deadlineNanos) {
+         return true;
+     }
+
+    /**
+     * Execute a {@link ScheduledRunnable} from outside the event loop thread. Note that schedule events which
+     * occur on the event loop thread do not interact with this method.
+     * @param runnable The {@link ScheduledRunnable} to execute.
+     */
+    protected void executeScheduledRunnable(ScheduledRunnable runnable) {
+        execute(runnable);
     }
 }

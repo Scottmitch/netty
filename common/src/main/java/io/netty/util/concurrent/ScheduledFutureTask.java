@@ -24,7 +24,8 @@ import java.util.concurrent.Delayed;
 import java.util.concurrent.TimeUnit;
 
 @SuppressWarnings("ComparableImplementedButEqualsNotOverridden")
-final class ScheduledFutureTask<V> extends PromiseTask<V> implements ScheduledFuture<V>, PriorityQueueNode {
+final class ScheduledFutureTask<V> extends PromiseTask<V> implements ScheduledFuture<V>, PriorityQueueNode,
+        ScheduledRunnable {
     private static final long START_TIME = System.nanoTime();
 
     static long nanoTime() {
@@ -101,6 +102,7 @@ final class ScheduledFutureTask<V> extends PromiseTask<V> implements ScheduledFu
         return super.executor();
     }
 
+    @Override
     public long deadlineNanos() {
         return deadlineNanos;
     }
@@ -159,13 +161,11 @@ final class ScheduledFutureTask<V> extends PromiseTask<V> implements ScheduledFu
             if (delayNanos() > 0L) {
                 // Not yet expired, need to add or remove from queue
                 if (isCancelled()) {
-                    scheduledExecutor().scheduledTaskQueue().removeTyped(this);
+                    scheduledExecutor().removedScheduleFromEventLoop(this);
                 } else {
                     scheduledExecutor().scheduleFromEventLoop(this);
                 }
-                return;
-            }
-            if (periodNanos == 0) {
+            } else if (periodNanos == 0) {
                 if (setUncancellableInternal()) {
                     V result = runTask();
                     setSuccessInternal(result);

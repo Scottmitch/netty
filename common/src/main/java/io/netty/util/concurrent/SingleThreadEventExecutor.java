@@ -43,13 +43,17 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
+import static java.lang.Math.max;
+import static java.lang.Math.min;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+
 /**
  * Abstract base class for {@link OrderedEventExecutor}'s that execute all its submitted tasks in a single thread.
  *
  */
 public abstract class SingleThreadEventExecutor extends AbstractScheduledEventExecutor implements OrderedEventExecutor {
 
-    static final int DEFAULT_MAX_PENDING_EXECUTOR_TASKS = Math.max(16,
+    static final int DEFAULT_MAX_PENDING_EXECUTOR_TASKS = max(16,
             SystemPropertyUtil.getInt("io.netty.eventexecutor.maxPendingTasks", Integer.MAX_VALUE));
 
     private static final InternalLogger logger =
@@ -155,7 +159,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                                         RejectedExecutionHandler rejectedHandler) {
         super(parent);
         this.addTaskWakesUp = addTaskWakesUp;
-        this.maxPendingTasks = Math.max(16, maxPendingTasks);
+        this.maxPendingTasks = max(16, maxPendingTasks);
         this.executor = ThreadExecutorMap.apply(executor, this);
         taskQueue = newTaskQueue(this.maxPendingTasks);
         rejectedExecutionHandler = ObjectUtil.checkNotNull(rejectedHandler, "rejectedHandler");
@@ -280,34 +284,15 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
             return true;
         }
         long nanoTime = AbstractScheduledEventExecutor.nanoTime();
-        for (;;) {
-            Runnable scheduledTask = pollScheduledTask(nanoTime);
-            if (scheduledTask == null) {
-                return true;
-            }
+        Runnable scheduledTask = pollScheduledTask(scheduledTaskQueue, nanoTime);
+        while (scheduledTask != null) {
             if (!taskQueue.offer(scheduledTask)) {
                 // No space left in the task queue add it back to the scheduledTaskQueue so we pick it up again.
                 scheduledTaskQueue.add((ScheduledFutureTask<?>) scheduledTask);
                 return false;
             }
+            scheduledTask = pollScheduledTask(scheduledTaskQueue, nanoTime);
         }
-    }
-
-    /**
-     * @return {@code true} if at least one scheduled task was executed.
-     */
-    private boolean executeExpiredScheduledTasks() {
-        if (scheduledTaskQueue == null || scheduledTaskQueue.isEmpty()) {
-            return false;
-        }
-        long nanoTime = AbstractScheduledEventExecutor.nanoTime();
-        Runnable scheduledTask = pollScheduledTask(nanoTime);
-        if (scheduledTask == null) {
-            return false;
-        }
-        do {
-            safeExecute(scheduledTask);
-        } while ((scheduledTask = pollScheduledTask(nanoTime)) != null);
         return true;
     }
 
@@ -387,6 +372,8 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
     }
 
     /**
+     * @deprecated Use {@link #runScheduledAndExecutorTasks()} instead.
+     *
      * Execute all expired scheduled tasks and all current tasks in the executor queue until both queues are empty,
      * or {@code maxDrainAttempts} has been exceeded.
      * @param maxDrainAttempts The maximum amount of times this method attempts to drain from queues. This is to prevent
@@ -394,22 +381,52 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
      *                         make progress and return to the selector mechanism to process inbound I/O events.
      * @return {@code true} if at least one task was run.
      */
+    @Deprecated
     protected final boolean runScheduledAndExecutorTasks(final int maxDrainAttempts) {
-        assert inEventLoop();
-        boolean ranAtLeastOneTask;
-        int drainAttempt = 0;
-        do {
-            // We must run the taskQueue tasks first, because the scheduled tasks from outside the EventLoop are queued
-            // here because the taskQueue is thread safe and the scheduledTaskQueue is not thread safe.
-            ranAtLeastOneTask = runExistingTasksFrom(taskQueue) | executeExpiredScheduledTasks();
-        } while (ranAtLeastOneTask && ++drainAttempt < maxDrainAttempts);
+        boolean ranAtLeastOneTask = false;
+        for (int i = 0; i < maxDrainAttempts; ++i) {
+            ranAtLeastOneTask |= runScheduledAndExecutorTasks0();
+        }
 
-        if (drainAttempt > 0) {
+        if (ranAtLeastOneTask) {
             lastExecutionTime = ScheduledFutureTask.nanoTime();
         }
         afterRunningAllTasks();
 
-        return drainAttempt > 0;
+        return ranAtLeastOneTask;
+    }
+
+    /**
+     * Execute all expired scheduled tasks and all current tasks in the executor queue until both queues are empty,
+     * or {@code maxDrainAttempts} has been exceeded.
+     * @return {@code true} if at least a task was executed.
+     */
+    protected final boolean runScheduledAndExecutorTasks() {
+        assert inEventLoop();
+        // We must run the taskQueue tasks first, because the scheduled tasks from outside the EventLoop are queued
+        // here because the taskQueue is thread safe and the scheduledTaskQueue is not thread safe.
+        boolean ranAtLeastOneTask = runScheduledAndExecutorTasks0();
+        if (ranAtLeastOneTask) {
+            lastExecutionTime = ScheduledFutureTask.nanoTime();
+        }
+        afterRunningAllTasks();
+
+        return ranAtLeastOneTask;
+    }
+
+    private boolean runScheduledAndExecutorTasks0() {
+        boolean ranAtLeastOneTask = runExistingTasksFrom(taskQueue);
+        if (scheduledTaskQueue != null && !scheduledTaskQueue.isEmpty()) {
+            final long nanoTime = AbstractScheduledEventExecutor.nanoTime();
+            Runnable scheduledTask = pollScheduledTask(scheduledTaskQueue, nanoTime);
+            if (scheduledTask != null) {
+                do {
+                    safeExecute(scheduledTask);
+                } while ((scheduledTask = pollScheduledTask(scheduledTaskQueue, nanoTime)) != null);
+                ranAtLeastOneTask = true;
+            }
+        }
+        return ranAtLeastOneTask;
     }
 
     /**
@@ -443,14 +460,20 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         if (task == null) {
             return false;
         }
-        int remaining = Math.min(maxPendingTasks, taskQueue.size());
-        safeExecute(task);
-        // Use taskQueue.poll() directly rather than pollTaskFrom() since the latter may
-        // silently consume more than one item from the queue (skips over WAKEUP_TASK instances)
-        while (remaining-- > 0 && (task = taskQueue.poll()) != null) {
+
+        // It is assumed the size() operation will be constant time. This is true for the blocking queue which uses
+        // an AtomicInteger to approximate size, and also true of the MPSC queue which should be constant time when
+        // executed from the consumer thread (e.g. the EventLoop).
+        int remaining = maxTasksToProcess(taskQueue.size());
+        do {
             safeExecute(task);
-        }
+        } while (--remaining > 0 && (task = pollTaskFrom(taskQueue)) != null);
+
         return true;
+    }
+
+    private static int maxTasksToProcess(int taskQueueSize) {
+        return max(256, taskQueueSize) + min(Integer.MAX_VALUE - taskQueueSize, min(4096, taskQueueSize >> 2));
     }
 
     /**
@@ -760,23 +783,20 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
             gracefulShutdownStartTime = ScheduledFutureTask.nanoTime();
         }
 
-        if (runAllTasks() || runShutdownHooks()) {
-            if (isShutdown()) {
-                // Executor shut down - no new tasks anymore.
-                return true;
-            }
-
+        final boolean runAllTasks = runAllTasks();
+        final boolean runShutdownHooks = runShutdownHooks();
+        final long nanoTime = ScheduledFutureTask.nanoTime();
+        if (runAllTasks || runShutdownHooks) {
             // There were tasks in the queue. Wait a little bit more until no tasks are queued for the quiet period or
-            // terminate if the quiet period is 0.
+            // terminate if the quiet period is 0 or we have timed out of graceful shutdown.
             // See https://github.com/netty/netty/issues/4241
-            if (gracefulShutdownQuietPeriod == 0) {
+            if (isShutdown() || gracefulShutdownQuietPeriod == 0 ||
+                    nanoTime - gracefulShutdownStartTime > gracefulShutdownTimeout) {
                 return true;
             }
             taskQueue.offer(WAKEUP_TASK);
             return false;
         }
-
-        final long nanoTime = ScheduledFutureTask.nanoTime();
 
         if (isShutdown() || nanoTime - gracefulShutdownStartTime > gracefulShutdownTimeout) {
             return true;
@@ -787,7 +807,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
             // TODO: Change the behavior of takeTask() so that it returns on timeout.
             taskQueue.offer(WAKEUP_TASK);
             try {
-                Thread.sleep(100);
+                Thread.sleep(min(100, NANOSECONDS.toMillis(gracefulShutdownQuietPeriod)));
             } catch (InterruptedException e) {
                 // Ignore
             }

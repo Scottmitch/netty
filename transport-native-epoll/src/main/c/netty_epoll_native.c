@@ -176,15 +176,6 @@ static void netty_epoll_native_eventFdRead(JNIEnv* env, jclass clazz, jint fd) {
     }
 }
 
-static void netty_epoll_native_timerFdRead(JNIEnv* env, jclass clazz, jint fd) {
-    uint64_t timerFireCount;
-
-    if (read(fd, &timerFireCount, sizeof(uint64_t)) < 0) {
-        // it is expected that this is only called where there is known to be activity, so this is an error.
-        netty_unix_errors_throwChannelExceptionErrorNo(env, "read() failed: ", errno);
-    }
-}
-
 static jint netty_epoll_native_epollCreate(JNIEnv* env, jclass clazz) {
     jint efd;
     if (epoll_create1) {
@@ -535,7 +526,6 @@ static const JNINativeMethod fixed_method_table[] = {
   { "timerFd", "()I", (void *) netty_epoll_native_timerFd },
   { "eventFdWrite", "(IJ)V", (void *) netty_epoll_native_eventFdWrite },
   { "eventFdRead", "(I)V", (void *) netty_epoll_native_eventFdRead },
-  { "timerFdRead", "(I)V", (void *) netty_epoll_native_timerFdRead },
   { "timerFdSetTime", "(III)V", (void *) netty_epoll_native_timerFdSetTime },
   { "epollCreate", "()I", (void *) netty_epoll_native_epollCreate },
   { "epollWait0", "(IJIIII)I", (void *) netty_epoll_native_epollWait0 }, // This method is deprecated!

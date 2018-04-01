@@ -85,8 +85,12 @@ public final class Native {
     private static native int eventFd();
     private static native int timerFd();
     public static native void eventFdWrite(int fd, long value);
+
+    /**
+     * @deprecated this method is no longer supported. This functionality is internal to this package.
+     */
+    @Deprecated
     public static native void eventFdRead(int fd);
-    static native void timerFdRead(int fd);
     static native void timerFdSetTime(int fd, int sec, int nsec) throws IOException;
 
     public static FileDescriptor newEpollCreate() {
@@ -135,7 +139,7 @@ public final class Native {
 
     /**
      * Non-blocking variant of
-     * {@link #epollWait(FileDescriptor, EpollEventArray, FileDescriptor, int, int)}
+     * {@link #epollWait(FileDescriptor, EpollEventArray, boolean)}
      * that will also hint to processor we are in a busy-wait loop.
      */
     public static int epollBusyWait(FileDescriptor epollFd, EpollEventArray events) throws IOException {

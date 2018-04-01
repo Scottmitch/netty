@@ -24,6 +24,7 @@ import io.netty.channel.SelectStrategy;
 import io.netty.channel.SingleThreadEventLoop;
 import io.netty.util.IntSupplier;
 import io.netty.util.concurrent.RejectedExecutionHandler;
+import io.netty.util.concurrent.ScheduledRunnable;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.ReflectionUtil;
@@ -35,9 +36,8 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.channels.CancelledKeyException;
 import java.nio.channels.SelectableChannel;
-import java.nio.channels.Selector;
 import java.nio.channels.SelectionKey;
-
+import java.nio.channels.Selector;
 import java.nio.channels.spi.SelectorProvider;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
@@ -65,6 +65,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     private static final int MIN_PREMATURE_SELECTOR_RETURNS = 3;
     private static final int SELECTOR_AUTO_REBUILD_THRESHOLD;
+    private static final long WAKEUP_PENDING = -1L;
+    private static final long NO_TIMEOUT_SCHEDULED = Long.MAX_VALUE;
 
     private final IntSupplier selectNowSupplier = new IntSupplier() {
         @Override
@@ -117,14 +119,11 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     private final SelectorProvider provider;
 
-    private static final long AWAKE = -1L;
-    private static final long NONE = Long.MAX_VALUE;
-
     // nextWakeupNanos is:
-    //    AWAKE            when EL is awake
-    //    NONE             when EL is waiting with no wakeup scheduled
-    //    other value T    when EL is waiting with wakeup scheduled at time T
-    private final AtomicLong nextWakeupNanos = new AtomicLong(AWAKE);
+    //    WAKEUP_PENDING         when EL has been asked to wakeup
+    //    NO_TIMEOUT_SCHEDULED   when EL has not been asked to wakeup and no known known minimum timer is scheduled
+    //    other value T          when EL is waiting with wakeup scheduled at time T
+    private final AtomicLong nextWakeupNanos = new AtomicLong(NO_TIMEOUT_SCHEDULED);
 
     private final SelectStrategy selectStrategy;
 
@@ -447,19 +446,25 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                         // fall-through to SELECT since the busy-wait is not supported with NIO
 
                     case SelectStrategy.SELECT:
-                        long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
-                        if (curDeadlineNanos == -1L) {
-                            curDeadlineNanos = NONE; // nothing on the calendar
-                        }
-                        nextWakeupNanos.set(curDeadlineNanos);
                         try {
-                            if (!hasTasks()) {
-                                strategy = select(curDeadlineNanos);
+                            long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
+                            if (curDeadlineNanos == -1L) { // nothing on the calendar
+                                nextWakeupNanos.set(NO_TIMEOUT_SCHEDULED);
+                                strategy = hasTasks() ? selectNow() : selector.select();
+                            } else {
+                                nextWakeupNanos.set(curDeadlineNanos);
+                                strategy = hasTasks() ? selectNow() : select(curDeadlineNanos);
                             }
                         } finally {
-                            // This update is just to help block unnecessary selector wakeups
-                            // so use of lazySet is ok (no race condition)
-                            nextWakeupNanos.lazySet(AWAKE);
+                            // Clear the nextWakeupNanos state so we will not miss any future wakeups. If there is a
+                            // race nextWakeupNanos was changed in the mean time by another thread we handle the values:
+                            // - WAKEUP_PENDING - force a wakeup now just to make sure it isn't missed in the future.
+                            // - <real value> - assume the next call to select will calculate the correct wakeup time.
+                            //                  TODO(scott): this isn't true if the scheduled tasks aren't executed and
+                            //                  put into the PriorityQueue due to ioRatio. pre-existing behavior!
+                            if (nextWakeupNanos.getAndSet(NO_TIMEOUT_SCHEDULED) == WAKEUP_PENDING) {
+                                selector.wakeup();
+                            }
                         }
                         // fall through
                     default:
@@ -773,21 +778,18 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     @Override
     protected void wakeup(boolean inEventLoop) {
-        if (!inEventLoop && nextWakeupNanos.getAndSet(AWAKE) != AWAKE) {
+        if (!inEventLoop && nextWakeupNanos.getAndSet(WAKEUP_PENDING) != WAKEUP_PENDING) {
             selector.wakeup();
         }
     }
 
     @Override
-    protected boolean beforeScheduledTaskSubmitted(long deadlineNanos) {
-        // Note this is also correct for the nextWakeupNanos == -1 (AWAKE) case
-        return deadlineNanos < nextWakeupNanos.get();
-    }
-
-    @Override
-    protected boolean afterScheduledTaskSubmitted(long deadlineNanos) {
-        // Note this is also correct for the nextWakeupNanos == -1 (AWAKE) case
-        return deadlineNanos < nextWakeupNanos.get();
+    protected boolean wakesUpForTask(Runnable task) {
+        if (task instanceof ScheduledRunnable) {
+            ScheduledRunnable scheduledRunnable = (ScheduledRunnable) task;
+            return !scheduledRunnable.isCancelled() && scheduledRunnable.deadlineNanos() < nextWakeupNanos.get();
+        }
+        return super.wakesUpForTask(task);
     }
 
     Selector unwrappedSelector() {
@@ -799,9 +801,6 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     }
 
     private int select(long deadlineNanos) throws IOException {
-        if (deadlineNanos == NONE) {
-            return selector.select();
-        }
         // Timeout will only be 0 if deadline is within 5 microsecs
         long timeoutMillis = deadlineToDelayNanos(deadlineNanos + 995000L) / 1000000L;
         return timeoutMillis <= 0 ? selector.selectNow() : selector.select(timeoutMillis);

@@ -29,13 +29,14 @@ import io.netty.channel.ChannelOption;
 import io.netty.channel.RecvByteBufAllocator;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.UncheckedBooleanSupplier;
-import org.junit.Test;
-
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.Test;
 
-import static org.junit.Assert.assertEquals;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.is;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 public class SocketAutoReadTest extends AbstractSocketTest {
@@ -124,7 +125,7 @@ public class SocketAutoReadTest extends AbstractSocketTest {
 
         AutoReadHandler(boolean callRead) {
             this.callRead = callRead;
-            latch2 = new CountDownLatch(callRead ? 3 : 2);
+            latch2 = new CountDownLatch(2);
         }
 
         @Override
@@ -137,10 +138,6 @@ public class SocketAutoReadTest extends AbstractSocketTest {
                 // Test calling read in the EventLoop thread to ensure a read is eventually done.
                 ctx.read();
             }
-        }
-
-        @Override
-        public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
             latch.countDown();
             latch2.countDown();
         }
@@ -152,7 +149,7 @@ public class SocketAutoReadTest extends AbstractSocketTest {
 
         void assertSingleReadSecondTry() throws InterruptedException {
             assertTrue(latch2.await(5, TimeUnit.SECONDS));
-            assertEquals(callRead ? 3 : 2, count.get());
+            assertThat(count.get(), is(greaterThanOrEqualTo(2)));
         }
     }
 
