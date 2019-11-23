@@ -15,8 +15,6 @@
  */
 package io.netty.handler.codec;
 
-import static io.netty.util.internal.ObjectUtil.checkPositive;
-
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -29,6 +27,10 @@ import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.StringUtil;
 
 import java.util.List;
+
+import static io.netty.util.internal.ObjectUtil.checkPositive;
+import static java.lang.Math.max;
+import static java.lang.Math.min;
 
 /**
  * {@link ChannelInboundHandlerAdapter} which decodes bytes in a stream-like fashion from one {@link ByteBuf} to an
@@ -76,7 +78,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     /**
      * Cumulate {@link ByteBuf}s by merge them into one {@link ByteBuf}'s, using memory copies.
      */
-    public static final Cumulator MERGE_CUMULATOR = new Cumulator() {
+    public static final Cumulator MERGE_CUMULATOR = new CompactingAccumulator() {
         @Override
         public ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
             try {
@@ -89,16 +91,21 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                     // See:
                     // - https://github.com/netty/netty/issues/2327
                     // - https://github.com/netty/netty/issues/1764
-                    cumulation = expandCumulation(alloc, cumulation, in);
-                } else {
-                    cumulation.writeBytes(in);
+                    return expandCumulation(alloc, cumulation, in);
                 }
+                cumulation.writeBytes(in);
                 return cumulation;
             } finally {
                 // We must release in in all cases as otherwise it may produce a leak if writeBytes(...) throw
                 // for whatever release (for example because of OutOfMemoryError)
                 in.release();
             }
+        }
+
+        @Override
+        public ByteBuf tryCompactAccumulation(ByteBufAllocator alloc, ByteBuf accumulation) {
+            discardSomeReadBytes(accumulation);
+            return accumulation;
         }
     };
 
@@ -107,10 +114,9 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
      * Be aware that {@link CompositeByteBuf} use a more complex indexing implementation so depending on your use-case
      * and the decoder implementation this may be slower then just use the {@link #MERGE_CUMULATOR}.
      */
-    public static final Cumulator COMPOSITE_CUMULATOR = new Cumulator() {
+    public static final Cumulator COMPOSITE_CUMULATOR = new CompactingAccumulator() {
         @Override
         public ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
-            ByteBuf buffer;
             try {
                 if (cumulation.refCnt() > 1) {
                     // Expand cumulation (by replace it) when the refCnt is greater then 1 which may happen when the
@@ -119,20 +125,18 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                     // See:
                     // - https://github.com/netty/netty/issues/2327
                     // - https://github.com/netty/netty/issues/1764
-                    buffer = expandCumulation(alloc, cumulation, in);
-                } else {
-                    CompositeByteBuf composite;
-                    if (cumulation instanceof CompositeByteBuf) {
-                        composite = (CompositeByteBuf) cumulation;
-                    } else {
-                        composite = alloc.compositeBuffer(Integer.MAX_VALUE);
-                        composite.addComponent(true, cumulation);
-                    }
-                    composite.addComponent(true, in);
-                    in = null;
-                    buffer = composite;
+                    return expandCumulation(alloc, cumulation, in);
                 }
-                return buffer;
+                final CompositeByteBuf composite;
+                if (cumulation instanceof CompositeByteBuf) {
+                    composite = (CompositeByteBuf) cumulation;
+                } else {
+                    composite = alloc.compositeBuffer(Integer.MAX_VALUE);
+                    composite.addComponent(true, cumulation);
+                }
+                composite.addComponent(true, in);
+                in = null;
+                return composite;
             } finally {
                 if (in != null) {
                     // We must release if the ownership was not transferred as otherwise it may produce a leak if
@@ -141,14 +145,21 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
                 }
             }
         }
+
+        @Override
+        public ByteBuf tryCompactAccumulation(ByteBufAllocator alloc, ByteBuf accumulation) {
+            discardSomeReadBytes(accumulation);
+            return accumulation;
+        }
     };
 
     private static final byte STATE_INIT = 0;
     private static final byte STATE_CALLING_CHILD_DECODE = 1;
     private static final byte STATE_HANDLER_REMOVED_PENDING = 2;
+    private static final int INTEGER_MAX_DOUBLEABLE_VALUE = Integer.MAX_VALUE >>> 1;
 
     ByteBuf cumulation;
-    private Cumulator cumulator = MERGE_CUMULATOR;
+    private CompactingAccumulator cumulator = (CompactingAccumulator) MERGE_CUMULATOR;
     private boolean singleDecode;
     private boolean first;
 
@@ -197,12 +208,29 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     /**
      * Set the {@link Cumulator} to use for cumulate the received {@link ByteBuf}s.
      */
-    public void setCumulator(Cumulator cumulator) {
-        this.cumulator = ObjectUtil.checkNotNull(cumulator, "cumulator");
+    public void setCumulator(final Cumulator newCumulator) {
+        ObjectUtil.checkNotNull(newCumulator, "newCumulator");
+        if (newCumulator instanceof CompactingAccumulator) {
+            this.cumulator = (CompactingAccumulator) newCumulator;
+        } else {
+            this.cumulator = new CompactingAccumulator() {
+                @Override
+                public ByteBuf tryCompactAccumulation(ByteBufAllocator alloc, ByteBuf accumulation) {
+                    discardSomeReadBytes(accumulation);
+                    return accumulation;
+                }
+
+                @Override
+                public ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
+                    return newCumulator.cumulate(alloc, cumulation, in);
+                }
+            };
+        }
     }
 
     /**
-     * Set the number of reads after which {@link ByteBuf#discardSomeReadBytes()} are called and so free up memory.
+     * Set the number of reads after which {@link #discardSomeReadBytes()} is called in an attempt to
+     * free memory.
      * The default is {@code 16}.
      */
     public void setDiscardAfterReads(int discardAfterReads) {
@@ -281,8 +309,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
             } finally {
                 if (cumulation != null && !cumulation.isReadable()) {
                     numReads = 0;
-                    cumulation.release();
-                    cumulation = null;
+                    releaseCumulation();
                 } else if (++ numReads >= discardAfterReads) {
                     // We did enough reads already try to discard some bytes so we not risk to see a OOME.
                     // See https://github.com/netty/netty/issues/4275
@@ -334,15 +361,48 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
     }
 
     protected final void discardSomeReadBytes() {
-        if (cumulation != null && !first && cumulation.refCnt() == 1) {
+        if (cumulation != null && !first) {
+            cumulation = cumulator.tryCompactAccumulation(cumulation.alloc(), cumulation);
+        }
+    }
+
+    private static void discardSomeReadBytes(ByteBuf cumulation) {
+        if (cumulation.refCnt() == 1) {
             // discard some bytes if possible to make more room in the
-            // buffer but only if the refCnt == 1  as otherwise the user may have
+            // buffer but only if the refCnt == 1 as otherwise the user may have
             // used slice().retain() or duplicate().retain().
             //
             // See:
             // - https://github.com/netty/netty/issues/2327
             // - https://github.com/netty/netty/issues/1764
             cumulation.discardSomeReadBytes();
+        }
+    }
+
+    private static ByteBuf expandCumulation(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in) {
+        ByteBuf newCumulation = allocateNewByteBuf(alloc, cumulation.capacity() + in.readableBytes(),
+                cumulation.capacity());
+        ByteBuf toRelease = newCumulation;
+        try {
+            newCumulation.writeBytes(cumulation);
+            newCumulation.writeBytes(in);
+            toRelease = cumulation;
+            return newCumulation;
+        } finally {
+            // Only release the old cumulation if the newCumulation copy operation completed successfully.
+            toRelease.release();
+        }
+    }
+
+    private static ByteBuf allocateNewByteBuf(ByteBufAllocator alloc, int minNewCapacity, int oldCapacity) {
+        return alloc.buffer(alloc.calculateNewCapacity(minNewCapacity,
+                min(INTEGER_MAX_DOUBLEABLE_VALUE, max(minNewCapacity, oldCapacity) << 1)));
+    }
+
+    private void releaseCumulation() {
+        if (cumulation != null) {
+            cumulation.release();
+            cumulation = null;
         }
     }
 
@@ -362,7 +422,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
         super.userEventTriggered(ctx, evt);
     }
 
-    private void channelInputClosed(ChannelHandlerContext ctx, boolean callChannelInactive) throws Exception {
+    private void channelInputClosed(ChannelHandlerContext ctx, boolean callChannelInactive) {
         CodecOutputList out = CodecOutputList.newInstance();
         try {
             channelInputClosed(ctx, out);
@@ -372,10 +432,7 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
             throw new DecoderException(e);
         } finally {
             try {
-                if (cumulation != null) {
-                    cumulation.release();
-                    cumulation = null;
-                }
+                releaseCumulation();
                 int size = out.size();
                 fireChannelRead(ctx, out, size);
                 if (size > 0) {
@@ -522,19 +579,6 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
         }
     }
 
-    static ByteBuf expandCumulation(ByteBufAllocator alloc, ByteBuf oldCumulation, ByteBuf in) {
-        ByteBuf newCumulation = alloc.buffer(oldCumulation.readableBytes() + in.readableBytes());
-        ByteBuf toRelease = newCumulation;
-        try {
-            newCumulation.writeBytes(oldCumulation);
-            newCumulation.writeBytes(in);
-            toRelease = oldCumulation;
-            return newCumulation;
-        } finally {
-            toRelease.release();
-        }
-    }
-
     /**
      * Cumulate {@link ByteBuf}s.
      */
@@ -545,5 +589,20 @@ public abstract class ByteToMessageDecoder extends ChannelInboundHandlerAdapter 
          * call {@link ByteBuf#release()} if a {@link ByteBuf} is fully consumed.
          */
         ByteBuf cumulate(ByteBufAllocator alloc, ByteBuf cumulation, ByteBuf in);
+    }
+
+    /**
+     * A {@link Cumulator} that also can also discard bytes in order to reclaim unused storage.
+     */
+    public interface CompactingAccumulator extends Cumulator {
+        /**
+         * Try to compact the accumulation {@link ByteBuf}. This may result in allocation of a new {@link ByteBuf}, or
+         * call methods like {@link ByteBuf#discardReadBytes()} to reclaim unused storage in-place.
+         *
+         * @param alloc A {@link ByteBufAllocator} which can be used to allocating a new {@link ByteBuf} if necessary.
+         * @param accumulation The existing cumulated bytes.
+         * @return The {@link ByteBuf} result of the compaction operation which should be used for future accumulation.
+         */
+        ByteBuf tryCompactAccumulation(ByteBufAllocator alloc, ByteBuf accumulation);
     }
 }
